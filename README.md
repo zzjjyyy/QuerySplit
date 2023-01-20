@@ -17,7 +17,7 @@
 
 
 # Non-SPJ Support
-* The author fail to update the Non-SPJ extension immediately dut to the vacation. But we will update the Non-SPJ extension version soon, as a new branch in the github, about the middle of February.
+* The author fail to update the Non-SPJ extension immediately due to the vacation. But we will update the Non-SPJ extension version soon, as a new branch in the github, about the middle of February.
 * However, Non-SPJ is not the focus of our paper, and its performance is close to the default Postgres. And our Non-SPJ extension is also not stable, for some Non-SPJ queries, an error could occur. So we will remain the source code of SPJ support-only version. And when you choose the pure SPJ workloads for test, we recommand you use the SPJ version.
 
 
