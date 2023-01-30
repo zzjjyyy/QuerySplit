@@ -16,7 +16,7 @@
 * The command "explain" is not supported yet in query split.
 
 # Non-SPJ Support
-* We try to make our Non-SPJ extension more stable and will upload it soon, as a new branch in the github, at the beginning of February.
+* We try to make our Non-SPJ extension more stable and will upload the first version soon, as a new branch in the repository, at the beginning of February.
 * However, Non-SPJ is not the focus of our paper, and its performance is close to the default Postgres. When you choose the pure SPJ workloads for test, we recommand you use the SPJ version.
 
 
