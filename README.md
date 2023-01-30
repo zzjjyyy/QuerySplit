@@ -14,11 +14,10 @@
 * To use the default PostgrteSQL, you can enter the command "switch to Postgres;".
 * Note that When you enter these commands, the database will return "ERROR: syntax error at or near "switch" at character 1", this is OK. Because PostgreSQL parser cannot identify these code correctly, however, the parameters are actually changed by our embedded code.
 * The command "explain" is not supported yet in query split.
-* For DSB, as there are join predicates between fact tables and cannot be removed, we have to modify such pedicates. The key point is each join predicate must contain at most one fact table.
 
 # Non-SPJ Support
-* The author fail to update the Non-SPJ extension immediately due to the vacation. But we will update the Non-SPJ extension version soon, as a new branch in the github, about the middle of February.
-* However, Non-SPJ is not the focus of our paper, and its performance is close to the default Postgres. And our Non-SPJ extension is also not stable, for some Non-SPJ queries, an error could occur. So we will remain the source code of SPJ support-only version. And when you choose the pure SPJ workloads for test, we recommand you use the SPJ version.
+* We try to make our Non-SPJ extension more stable and will upload it soon, as a new branch in the github, at the beginning of February.
+* However, Non-SPJ is not the focus of our paper, and its performance is close to the default Postgres. When you choose the pure SPJ workloads for test, we recommand you use the SPJ version.
 
 
 # Potential Bugs
