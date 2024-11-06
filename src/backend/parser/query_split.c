@@ -9,7 +9,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "utils/datum.h"
 #include "parser/query_split.h"
 #include "fe_utils/simple_list.h"
 #include "commands/event_trigger.h"
@@ -18,25 +17,10 @@
 #include "commands/vacuum.h"
 #include "utils/rel.h"
 #include "storage/buf_internals.h"
-#include "utils/builtins.h"
-#include "portability/instr_time.h"
-#include "time.h"
 
 #define NEWBETTER 1
 #define OLDBETTER 2
 
-double total_size = 0.0;
-//long long optimize_time = 0;
-//long long execution_time = 0;
-//long long materialization_time = 0;
-
-#define half_rounded(x) (((x) + ((x) < 0 ? 0 : 1)) / 2)
-
-List* rel2relids = NIL;
-
-Datum pg_relation_size(PG_FUNCTION_ARGS);
-
-static double getMatSize(Oid relid);
 //Create a local query
 static Query* createQuery(const Query* querytree, CommandDest dest, List* rtable, Index* transfer_array, int length);
 //change the RangeTblEntry relid to the new one
@@ -59,7 +43,7 @@ static List* grFK(List* rtable);
 //is this subquery is the last ?
 static int hasNext(bool* graph, int length);
 // Is this expr refer to two relationship table ?
-static bool is_2relationship(OpExpr* opexpr, bool* is_relationship, int length);
+static bool is_2relationship(OpExpr * opexpr, bool* is_relationship, int length);
 //Is this a Entity-to-Relationship Join ?
 static bool is_ER(OpExpr* opexpr, bool* is_relationship, int length);
 //Is a foreign key join ?
@@ -71,25 +55,25 @@ static bool* List2Graph(bool* is_relationship, List* joinlist, List* FKlist, int
 //Make a aggregation function as result
 static List* removeAggref(List* targetList);
 //give the new value to some var, prepare for the next subquery
-static List* Prepare4Next(Query* global_query, Index* transfer_array, DR_intorel* receiver, PlannedStmt* plannedstmt, char* relname, List* FKlist);
-static void Recon(char* query_string, char* commandTag, Query* ori_query, char* completionTag);
+static List* Prepare4Next(Query* global_query, Index* transfer_array, DR_intorel* receiver, PlannedStmt* plannedstmt,char* relname, List* FKlist);
+static void Recon(char* query_string, char* commandTag, Node* pstmt, Query* ori_query, char* completionTag);
 //remove redundant join
 static void rRj(Query* querytree);
 //Transfer fromlist to the local
 static List* setfromlist(List* fromlist, Index* transfer_array, int length);
 //Transfer global var to local
-static List* setjoinlist(List* rclist, Index* transfer_array, int length);
+static List* setjoinlist(List* rclist, CommandDest dest, Index* transfer_array, int length);
 //Make a local target list
 static List* settargetlist(const List* global_rtable, List* local_rtable, CommandDest dest, List* varlist, List* targetlist, Index* transfer_array, int length);
 //Remove used jointree
-static List* simplifyjoinlist(List* list, Index* transfer_array, bool* graph, int length);
+static List* simplifyjoinlist(List* list, CommandDest dest, Index* transfer_array, bool* graph, int length);
 //Split Query by Foreign Key
-static List* spq(char* query_string, char* commandTag, Query* querytree, char* completionTag);
+static List* spq(char* query_string, char* commandTag, Node* pstmt, Query* querytree, char* completionTag);
 //from postgres.c
 extern void start_xact_command();
 static int tarfunc(Index* rels, PlannedStmt* new, PlannedStmt* old);
 //Execute the local query
-static List* QSExecutor(char* query_string, const char* commandTag, PlannedStmt* plannedstmt, CommandDest dest, char* relname, char* completionTag, Query* querytree, Index* transfer_array, List* FKlist);
+static List* QSExecutor(char* query_string, const char* commandTag, Node* pstmt, PlannedStmt* plannedstmt, CommandDest dest, char* relname, char* completionTag, Query* querytree, Index* transfer_array, List* FKlist, MemoryContext oldcontext);
 //find the subquery with lowest cost to be executed
 static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfer_array, int length);
 static Plan* find_node_with_nleaf_recursive(Plan* plan, int nleaf, int* leaf_has, int* depth);
@@ -103,16 +87,13 @@ CommandDest mydest;
 Index* transfer_array = NULL;
 
 //The interface
-void doQSparse(const char* query_string, const char* commandTag, Query* querytree, char* completionTag)
+void doQSparse(const char* query_string, const char* commandTag, Node* pstmt, Query* querytree, char* completionTag)
 {
-	srand((unsigned) time(NULL));
 	List* FKlist = NIL;
 	if (querytree->commandType != CMD_UTILITY && query_splitting_algorithm != Minsubquery)
 	{
-		MemoryContext oldcontext = MemoryContextSwitchTo(MessageContext);
 		//remove Redundant Join
 		rRj(querytree);
-		MemoryContextSwitchTo(oldcontext);
 	}
 	PlannedStmt* plannedstmt = NULL;
 	if (querytree->commandType == CMD_UTILITY)
@@ -125,7 +106,7 @@ void doQSparse(const char* query_string, const char* commandTag, Query* querytre
 		plannedstmt->utilityStmt = querytree->utilityStmt;
 		plannedstmt->stmt_location = querytree->stmt_location;
 		plannedstmt->stmt_len = querytree->stmt_len;
-		QSExecutor(query_string, commandTag, plannedstmt, DestRemote, NULL, completionTag, querytree, NULL, NIL);
+		QSExecutor(query_string, commandTag, pstmt, plannedstmt, DestRemote, NULL, completionTag, querytree, NULL, NIL, oldcontext);
 		return;
 	}
 	ListCell* lc;
@@ -133,29 +114,25 @@ void doQSparse(const char* query_string, const char* commandTag, Query* querytre
 	foreach(lc, querytree->rtable)
 	{
 		RangeTblEntry* rte = (RangeTblEntry*)lfirst(lc);
-		if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+		if (rte->relkind != RELKIND_RELATION)
 		{
 			MemoryContext oldcontext = MemoryContextSwitchTo(MessageContext);
 			plannedstmt = planner(querytree, CURSOR_OPT_PARALLEL_OK, NULL);
-			QSExecutor(query_string, commandTag, plannedstmt, DestRemote, NULL, completionTag, querytree, NULL, NIL);
+			QSExecutor(query_string, commandTag, pstmt, plannedstmt, DestRemote, NULL, completionTag, querytree, NULL, NIL, oldcontext);
 			return;
 		}
 		length++;
-		
 	}
 	if (length <= 2)
 	{
 		MemoryContext oldcontext = MemoryContextSwitchTo(MessageContext);
 		plannedstmt = planner(querytree, CURSOR_OPT_PARALLEL_OK, NULL);
-		QSExecutor(query_string, commandTag, plannedstmt, DestRemote, NULL, completionTag, querytree, NULL, NIL);
+		QSExecutor(query_string, commandTag, pstmt, plannedstmt, DestRemote, NULL, completionTag, querytree, NULL, NIL, oldcontext);
 		return;
 	}
-	total_size = 0.0;
-	//optimize_time = 0;
-	//execution_time = 0;
-	//materialization_time = 0;
 	//split parent query by foreign key
-	Recon(query_string, commandTag, querytree, completionTag);
+	Recon(query_string, commandTag, pstmt, querytree, completionTag);
+
 	return;
 }
 
@@ -211,25 +188,22 @@ static void rRj(Query* querytree)
 	return;
 }
 
-static void Recon(char* query_string, char* commandTag, Query* ori_query, char* completionTag)
+static void Recon(char* query_string, char* commandTag, Node* pstmt, Query* ori_query, char* completionTag)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(MessageContext);
 	Query* global_query = copyObjectImpl(ori_query);
-	List* ori_rtable = copyObjectImpl(ori_query->rtable);
 	PlannedStmt* plannedstmt = NULL;
 	if (global_query->commandType == CMD_UTILITY)
 	{
-		MemoryContextSwitchTo(oldcontext);
 		plannedstmt = QSOptimizer(global_query, NULL, NULL, 0);
-		QSExecutor(query_string, commandTag, plannedstmt, DestRemote, NULL, completionTag, NULL, NULL, NIL);
+		QSExecutor(query_string, commandTag, pstmt, plannedstmt, DestRemote, NULL, completionTag, NULL, NULL, NIL, oldcontext);
 		return;
 	}
 	int length = global_query->rtable->length;
 	if (length == 1)
 	{
-		MemoryContextSwitchTo(oldcontext);
 		plannedstmt = QSOptimizer(global_query, NULL, NULL, length);
-		QSExecutor(query_string, commandTag, plannedstmt, DestRemote, NULL, completionTag, NULL, NULL, NIL);
+		QSExecutor(query_string, commandTag, pstmt, plannedstmt, DestRemote, NULL, completionTag, NULL, NULL, NIL, oldcontext);
 		return;
 	}
 	List* RClist = NIL;
@@ -262,74 +236,21 @@ static void Recon(char* query_string, char* commandTag, Query* ori_query, char* 
 	bool* graph = List2Graph(is_relationship, Joinlist, FKlist, length);
 	//value start from 1, index start from 0
 	transfer_array = (Index*)palloc(length * sizeof(Index));
-#ifdef artificial_error
-	int i = 1;
-	foreach(lc, ori_rtable)
-	{
-		RangeTblEntry* rte = (RangeTblEntry*)lfirst(lc);
-		My* my = (My*)palloc(sizeof(My));
-		my->bms = bms_add_member(NULL, i);
-		my->relname = (char*)palloc((strlen(rte->alias->aliasname) + 1) * sizeof(char));
-		strcpy(my->relname, rte->alias->aliasname);
-		rel2relids = lappend(rel2relids, my);
-		i++;
-	}
-#endif
-	MemoryContextSwitchTo(oldcontext);
 	while (plannedstmt = QSOptimizer(global_query, graph, transfer_array, length))
 	{
 		queryId++;
-#ifdef artificial_error
-		char* thename = ((RangeTblEntry*)lfirst(list_head(plannedstmt->rtable)))->alias->aliasname;
-		foreach(lc, rel2relids)
-		{
-			My* my = (My*)lfirst(lc);
-			if (strcmp(my->relname, thename) == 0)
-			{
-				ListCell* lc1;
-				Bitmapset* bms = my->bms;
-				foreach(lc1, plannedstmt->rtable)
-				{
-					RangeTblEntry* rte1 = (RangeTblEntry*)lfirst(lc1);
-					ListCell* lc2;
-					foreach(lc2, rel2relids)
-					{
-						My* rte2 = (My*)lfirst(lc2);
-						if (strcmp(rte1->alias->aliasname, rte2->relname) == 0)
-						{
-							oldcontext = MemoryContextSwitchTo(MessageContext);
-							bms = bms_union(bms, rte2->bms);
-							MemoryContextSwitchTo(oldcontext);
-							break;
-						}
-					}
-				}
-				my->bms = bms;
-				break;
-			}	
-		}
-#endif
 		char* relname = NULL;
 		//Should we output the result or save it as a temporary table
 		if (mydest == DestIntoRel)
 		{
-			oldcontext = MemoryContextSwitchTo(MessageContext);
 			relname = palloc(7 * sizeof(char));
 			sprintf(relname, "temp%d", queryId);
-			MemoryContextSwitchTo(oldcontext);
 		}
 		//Execute the subquery and do some change for next subquery creation
-		//instr_time start_time, end_time;
-		//INSTR_TIME_SET_CURRENT(start_time);
-		FKlist = QSExecutor(query_string, commandTag, plannedstmt, mydest, relname, completionTag, global_query, transfer_array, FKlist);
-		//INSTR_TIME_SET_CURRENT(end_time);
-		//execution_time += end_time.QuadPart - start_time.QuadPart;
-		finish_xact_command();
+		FKlist = QSExecutor(query_string, commandTag, pstmt, plannedstmt, mydest, relname, completionTag, global_query, transfer_array, FKlist, oldcontext);
+		//finish_xact_command();
 		if (mydest == DestRemote)
 		{
-			//FILE* fp = fopen("D:\\Database\\QSplit.txt", "a+");
-			//fprintf(fp, "%d\t%lf\n", queryId - 1, total_size);
-			//fclose(fp);
 			break;
 		}
 		switch (global_query->jointree->quals->type)
@@ -366,10 +287,8 @@ static void Recon(char* query_string, char* commandTag, Query* ori_query, char* 
 //Planner
 static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfer_array, int length)
 {
-	//instr_time start_time, end_time;
-	//INSTR_TIME_SET_CURRENT(start_time);
-	start_xact_command();
 	PlannedStmt* result = NULL;
+	//start_xact_command();
 	int remain = hasNext(graph, length);
 	int X = 0, Y = 0;
 	Index rels[2] = { 0, 0 };
@@ -380,30 +299,24 @@ static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfe
 			PlannedStmt* temp = planner(copyObjectImpl(global_query), CURSOR_OPT_PARALLEL_OK, NULL);
 			int leaf_has = 0, depth = 0;
 			Plan* temp_plan = find_node_with_nleaf_recursive(temp->planTree, 2, &leaf_has, &depth);
-			if (temp_plan)
-			{
-				walk_plantree(temp_plan, rels);
-				rels[0] = ((RangeTblEntry*)list_nth(global_query->rtable, rels[0] - 1))->relid;
-				rels[1] = ((RangeTblEntry*)list_nth(global_query->rtable, rels[1] - 1))->relid;
-			}
-			else
-			{
-				rels[0] = 1;
-				rels[1] = 1;
-			}
+			walk_plantree(temp_plan, rels);
+			rels[0] = ((RangeTblEntry*)list_nth(global_query->rtable, rels[0] - 1))->relid;
+			rels[1] = ((RangeTblEntry*)list_nth(global_query->rtable, rels[1] - 1))->relid;
 		}
 		for (int i = 0; i < length; i++)
 		{
 			if (remain > 1)
 				mydest = DestIntoRel;
-			else
+			else if (remain == 1)
 				mydest = DestRemote;
+			else if (remain == 0)
+				return NULL;
 			for (int j = 0; j < length; j++)
 				transfer_array[j] = 0;
 			//Get the rang table list for this subgraph
 			List* rtable = getRT_2(global_query->rtable, graph, length, i, transfer_array);
 			//Can this subgraph make a join ?
-			if (rtable->length < 2 && global_query->rtable->length > 1)
+			if (rtable->length < 2)
 			{
 				continue;
 			}
@@ -497,25 +410,10 @@ static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfe
 		}
 		for (int j = 0; j < length; j++)
 		{
-			if (transfer_array[j] != 0)
+			if (graph[X * length + j] == true)
 			{
-				/*
-				if (graph[X * length + j] == true)
-				{
-					graph[X * length + j] = false;
-					graph[j * length + X] = false;
-				}
-				*/
-				for (int k = 0; k < length; k++)
-				{
-					if (transfer_array[k] != 0)
-					{
-						if (graph[j * length + k] == true)
-						{
-							graph[j * length + k] = false;
-						}
-					}
-				}
+				graph[X * length + j] = false;
+				graph[j * length + X] = false;
 			}
 		}
 	}
@@ -526,7 +424,6 @@ static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfe
 		transfer_array[X] = 1;
 		transfer_array[Y] = 2;
 		graph[X * length + Y] = false;
-		/*
 		for (int i = 0; i < length; i++)
 		{
 			if (i < X)
@@ -551,13 +448,12 @@ static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfe
 				}
 			}
 		}
-		*/
 	}
 	switch (global_query->jointree->quals->type)
 	{
 		case T_BoolExpr:
 		{
-			((BoolExpr*)global_query->jointree->quals)->args = simplifyjoinlist(((BoolExpr*)global_query->jointree->quals)->args, transfer_array, graph, length);
+			((BoolExpr*)global_query->jointree->quals)->args = simplifyjoinlist(((BoolExpr*)global_query->jointree->quals)->args, mydest, transfer_array, graph, length);
 			break;
 		}
 		case T_OpExpr:
@@ -566,14 +462,13 @@ static PlannedStmt* QSOptimizer(Query* global_query, bool* graph, Index* transfe
 			break;
 		}
 	}
-	//INSTR_TIME_SET_CURRENT(end_time);
-	//optimize_time += end_time.QuadPart - start_time.QuadPart;
 	return result;
 }
 
 //Executor
-static List* QSExecutor(char* query_string, const char* commandTag, PlannedStmt* plannedstmt, CommandDest dest, char* relname, char* completionTag, Query* querytree, Index* transfer_array, List* FKlist)
+static List* QSExecutor(char* query_string, const char* commandTag, Node* pstmt, PlannedStmt* plannedstmt, CommandDest dest, char* relname, char* completionTag, Query* querytree, Index* transfer_array, List* FKlist, MemoryContext oldcontext)
 {
+	Oid relid;
 	int16 format;
 	Portal portal;
 	List* plantree_list;
@@ -585,7 +480,7 @@ static List* QSExecutor(char* query_string, const char* commandTag, PlannedStmt*
 	portal = CreatePortal("", true, true);
 	portal->visible = false;
 	PortalDefineQuery(portal, NULL, query_string, commandTag, plantree_list, NULL);
-	PortalStart(portal, NULL, 0, InvalidSnapshot);
+	PortalStart(portal, NULL, 0, SnapshotAny);
 	format = 0;
 	PortalSetResultFormat(portal, 1, &format);
 	if (dest == DestRemote)
@@ -599,11 +494,13 @@ static List* QSExecutor(char* query_string, const char* commandTag, PlannedStmt*
 		into->rel = makeRangeVar(NULL, relname, plannedstmt->stmt_location);
 		into->rel->relpersistence = RELPERSISTENCE_TEMP;
 		into->onCommit = ONCOMMIT_NOOP;
+		//into->onCommit = ONCOMMIT_DROP;
 		into->rel->inh = false;
 		into->skipData = false;
 		into->viewQuery = NULL;
 		receiver = CreateIntoRelDestReceiver(into);
 	}
+	MemoryContextSwitchTo(oldcontext);
 	//Executor
 	(void)PortalRun(portal, FETCH_ALL, true, true, receiver, receiver, completionTag);
 	if (dest == DestIntoRel)
@@ -626,8 +523,6 @@ static List* QSExecutor(char* query_string, const char* commandTag, PlannedStmt*
 		//total_size += s;
 		MemoryContextSwitchTo(context);
 	}
-	//if (portal->queryDesc != NULL)
-	//	writeFile("D://Database//Qsplit.txt", portal->queryDesc);
 	receiver->rDestroy(receiver);
 	PortalDrop(portal, false);
 	EndCommand(completionTag, dest);
@@ -691,6 +586,7 @@ static List* Prepare4Next(Query* global_query, Index* transfer_array, DR_intorel
 			prev = lc;
 		}
 	}
+	
 	Oid relid = RangeVarGetRelid(receiver->into->rel, NoLock, true);
 	Relation relation = table_open(relid, NoLock);
 	List* varlist = pull_var_clause((Node*)global_query->jointree, 0);
@@ -753,7 +649,7 @@ static List* Prepare4Next(Query* global_query, Index* transfer_array, DR_intorel
 		}
 		fkOptInfo->ref_relid -= before;
 	}
-	//◊”≤È—Ø…Êº∞µƒ»´æ÷relation
+	//Â≠êÊü•ËØ¢Ê∂âÂèäÁöÑÂÖ®Â±Ärelation
 	for (int i = length - 1; i > X; i--)
 	{
 		if (transfer_array[i] != 0)
@@ -774,25 +670,16 @@ static List* Prepare4Next(Query* global_query, Index* transfer_array, DR_intorel
 	foreach(lc, global_query->targetList)
 	{
 		TargetEntry* tar = (TargetEntry*)lfirst(lc);
-		Var* vtar = NULL;
+		Var* vtar;
 		if (tar->expr->type == T_Aggref)
 		{
 			TargetEntry* te = lfirst(((Aggref*)tar->expr)->args->head);
-			if (te->expr->type == T_Var)
-				vtar = (Var*)te->expr;
-			else if (te->expr->type == T_RelabelType)
-				vtar = (Var*)((RelabelType*)te->expr)->arg;
+			vtar = te->expr;
 		}
-		else if (tar->expr->type == T_RelabelType)
-		{
-			vtar = (Var*)((RelabelType*)tar->expr)->arg;
-		}
-		else if(tar->expr->type == T_Var)
+		else
 		{
 			vtar = (Var*)tar->expr;
 		}
-		if (vtar == NULL)
-			continue;
 		if (transfer_array[vtar->varnoold - 1] != 0)
 		{
 			tar->resorigtbl = relid;
@@ -830,8 +717,8 @@ static List* Prepare4Next(Query* global_query, Index* transfer_array, DR_intorel
 //transfer joinlist to join graph
 static bool* List2Graph(bool* is_relationship, List* joinlist, List* FKlist, int length)
 {
-	bool* graph = (bool*)palloc((uint64)length * length * sizeof(bool));
-	memset(graph, false, (uint64)length * length * sizeof(bool));
+	bool* graph = (bool*)palloc(length * length * sizeof(bool));
+	memset(graph, false, length * length * sizeof(bool));
 	ListCell* lc1;
 	if (query_splitting_algorithm == RelationshipCenter || query_splitting_algorithm == EntityCenter)
 	{
@@ -871,11 +758,8 @@ static bool* List2Graph(bool* is_relationship, List* joinlist, List* FKlist, int
 	}
 	foreach(lc1, joinlist)
 	{
-		OpExpr* opexpr = (OpExpr*)lfirst(lc1);
-		List* var1_list = pull_var_clause((Node*)lfirst(opexpr->args->head), 0);
-		Var* var1 = (Var*)lfirst(var1_list->head);
-		List* var2_list = pull_var_clause((Node*)lfirst(opexpr->args->head->next), 0);
-		Var* var2 = (Var*)lfirst(var2_list->head);
+		Var* var1 = (Var*)lfirst(((OpExpr*)lfirst(lc1))->args->head);
+		Var* var2 = (Var*)lfirst(((OpExpr*)lfirst(lc1))->args->head->next);
 		if (query_splitting_algorithm == Minsubquery)
 		{
 			if (var1->varno > var2->varno)
@@ -976,11 +860,7 @@ static bool is_RC(Expr* expr)
 	if (expr->type != T_OpExpr)
 		return true;
 	OpExpr* opexpr = (OpExpr*)expr;
-	List* left_vars = pull_var_clause((Node*)lfirst(opexpr->args->head), 0);
-	List* right_vars = pull_var_clause((Node*)lfirst(opexpr->args->head->next), 0);
-	if (left_vars != NIL && right_vars != NIL)
-		return false;
-	return  true;
+	return (((Node*)lfirst(opexpr->args->head->next))->type == T_Const);
 }
 
 //get rtable
@@ -1023,7 +903,7 @@ static List* getRT_2(List* prtable, bool* graph, int length, int i, Index* trans
 	return rtable;
 }
 
-//’“µΩglobal≥ˆø⁄
+//ÊâæÂà∞globalÂá∫Âè£
 static List* findvarlist(List* joinlist, Index* transfer_array, int length)
 {
 	ListCell* lc;
@@ -1033,10 +913,11 @@ static List* findvarlist(List* joinlist, Index* transfer_array, int length)
 		Expr* expr = (Expr*)lfirst(lc);
 		if (!is_RC(expr))
 		{
-			List* vars = pull_var_clause((Node*)expr, 0);
-			Var* var1 = lfirst(vars->head);
-			Var* var2 = (Var*)lfirst(vars->head->next);
-			//µ±«∞queryµΩÕ‚Œß
+			OpExpr* opexpr = (OpExpr*)expr;
+			NodeTag type = ((Node*)lfirst(opexpr->args->head))->type;
+			Var* var1 = lfirst(opexpr->args->head);
+			Var* var2 = (Var*)lfirst(opexpr->args->head->next);
+			//ÂΩìÂâçqueryÂà∞Â§ñÂõ¥
 			if (transfer_array[var1->varno - 1] != 0 && transfer_array[var2->varno - 1] == 0)
 			{
 				ListCell* lc1;
@@ -1107,7 +988,7 @@ static Query* createQuery(const Query* global_query, CommandDest dest, List* rta
 	{
 		case T_BoolExpr:
 		{
-			((BoolExpr*)query->jointree->quals)->args = setjoinlist(((BoolExpr*)query->jointree->quals)->args, transfer_array, length);
+			((BoolExpr*)query->jointree->quals)->args = setjoinlist(((BoolExpr*)query->jointree->quals)->args, dest, transfer_array, length);
 			break;
 		}
 		case T_OpExpr:
@@ -1126,51 +1007,79 @@ static Query* createQuery(const Query* global_query, CommandDest dest, List* rta
 
 static bool doNullTestTransfor(NullTest* expr, Index* transfer_array)
 {
-	List* varlist = pull_var_clause((Node*)expr, 0);
-	ListCell* lc;
-	foreach(lc, varlist)
-	{
-		Var* var = (Var*)lfirst(lc);
-		if(transfer_array[var->varno - 1] == 0)
-			return false;
-		var->varno = transfer_array[var->varno - 1];
-		var->varnoold = var->varno;
-	}
+	NodeTag type = nodeTag(expr->arg);
+	Var* var = NULL;
+	if (type == T_Var)
+		var = (Var*)expr->arg;
+	else if (type == T_RelabelType)
+		var = (Var*)((RelabelType*)expr->arg)->arg;
+	if (transfer_array[var->varno - 1] == 0)
+		return false;
+	var->varno = transfer_array[var->varno - 1];
+	var->varnoold = var->varno;
 	return true;
 }
 
 static bool doOpExprTransfor(OpExpr* expr, Index* transfer_array)
 {
 	bool flag = true;
-	List* varlist = pull_var_clause((Node*)expr, 0);
-	ListCell* lc;
-	foreach(lc, varlist)
+	NodeTag type1 = ((Node*)lfirst(expr->args->head))->type;
+	Var* var1 = NULL;
+	Var* var2 = NULL;
+	if (type1 == T_Var)
 	{
-		Var* var = (Var*)lfirst(lc);
-		if (transfer_array[var->varno - 1] == 0)
-			flag = false;
-		var->varno = transfer_array[var->varno - 1];
-		var->varnoold = var->varno;
+		var1 = (Var*)lfirst(expr->args->head);
+	}
+	else if (type1 == T_RelabelType)
+	{
+		var1 = (Var*)((RelabelType*)lfirst(expr->args->head))->arg;
+	}
+	NodeTag type2 = ((Node*)lfirst(expr->args->head->next))->type;
+	if (type2 == T_Var)
+	{
+		var2 = (Var*)lfirst(expr->args->head->next);
+	}
+	else if (type2 == T_RelabelType)
+	{
+		var2 = (Var*)((RelabelType*)lfirst(expr->args->head->next))->arg;
+	}
+	if (var1 && transfer_array[var1->varno - 1] == 0)
+	{
+		flag = false;
+	}
+	else if (var1)
+	{
+		var1->varno = transfer_array[var1->varno - 1];
+		var1->varnoold = var1->varno;
+	}
+	if (var2 && transfer_array[var2->varno - 1] == 0)
+	{
+		flag = false;
+	}
+	else if (var2)
+	{
+		var2->varno = transfer_array[var2->varno - 1];
+		var2->varnoold = var2->varno;
 	}
 	return flag;
 }
 
 static bool doScalarArrayOpExprTransfor(ScalarArrayOpExpr* expr, Index* transfer_array)
 {
-	List* varlist = pull_var_clause((Node*)expr, 0);
-	ListCell* lc;
-	foreach(lc, varlist)
-	{
-		Var* var = (Var*)lfirst(lc);
-		if (transfer_array[var->varno - 1] == 0)
-			return false;
-		var->varno = transfer_array[var->varno - 1];
-		var->varnoold = var->varno;
-	}
+	NodeTag type = nodeTag(lfirst(expr->args->head));
+	Var* var = NULL;
+	if (type == T_Var)
+		var = (Var*)lfirst(expr->args->head);
+	else if (type == T_RelabelType)
+		var = (Var*)((RelabelType*)lfirst(expr->args->head))->arg;
+	if (transfer_array[var->varno - 1] == 0)
+		return false;
+	var->varno = transfer_array[var->varno - 1];
+	var->varnoold = var->varno;
 	return true;
 }
 
-static List* setjoinlist(List* qualslist, Index* transfer_array, int length)
+static List* setjoinlist(List* qualslist, CommandDest dest, Index* transfer_array, int length)
 {
 	ListCell* lc;
 	foreach(lc, qualslist)
@@ -1200,7 +1109,7 @@ static List* setjoinlist(List* qualslist, Index* transfer_array, int length)
 			case T_BoolExpr:
 			{
 				BoolExpr* boolexpr = (BoolExpr*)expr;
-				boolexpr->args = setjoinlist(boolexpr->args, transfer_array, length);
+				boolexpr->args = setjoinlist(boolexpr->args, dest, transfer_array, length);
 				if (boolexpr->args == NULL)
 					flag = false;
 				break;
@@ -1214,7 +1123,7 @@ static List* setjoinlist(List* qualslist, Index* transfer_array, int length)
 	return qualslist;
 }
 
-static List* simplifyjoinlist(List* list, Index* transfer_array, bool* graph, int length)
+static List* simplifyjoinlist(List* list, CommandDest dest, Index* transfer_array, bool* graph, int length)
 {
 	ListCell* lc;
 	foreach(lc, list)
@@ -1222,7 +1131,7 @@ static List* simplifyjoinlist(List* list, Index* transfer_array, bool* graph, in
 		Expr* expr = (Expr*)lfirst(lc);
 		if (is_RC(expr))
 		{
-			List* varlist = pull_var_clause((Node*)expr, 0);
+			List* varlist = pull_var_clause(expr, 0);
 			Var* var = (Var*)lfirst(varlist->head);
 			if (transfer_array[var->varno - 1] != 0)
 				list = list_delete(list, lfirst(lc));
@@ -1232,10 +1141,8 @@ static List* simplifyjoinlist(List* list, Index* transfer_array, bool* graph, in
 			bool flag = false;
 			Index X = 0, Y = 0;
 			OpExpr* opexpr = (OpExpr*)expr;
-			List* var1_list = pull_var_clause((Node*)lfirst(opexpr->args->head), 0);
-			Var* var1 = (Var*)lfirst(var1_list->head);
-			List* var2_list = pull_var_clause((Node*)lfirst(opexpr->args->head->next), 0);
-			Var* var2 = (Var*)lfirst(var2_list->head);
+			Var* var1 = (Var*)lfirst(opexpr->args->head);
+			Var* var2 = (Var*)lfirst(opexpr->args->head->next);
 			Assert(var1->varno != var2->varno);
 			X = var1->varno - 1;
 			Y = var2->varno - 1;
@@ -1277,23 +1184,17 @@ static List* settargetlist(const List* global_rtable, List* local_rtable, Comman
 		bool reserved = false;
 		TargetEntry* tar = (TargetEntry*)lfirst(lc);
 		ListCell* lc1;
-		if (tar->expr->type == T_Aggref)
+		if (tar->expr->type != T_Var)
 		{
 			continue;
 		}
 		foreach(lc1, local_rtable)
 		{
 			RangeTblEntry* rte = (RangeTblEntry*)lfirst(lc1);
-			Var* vtar = NULL;
-			if(tar->expr->type == T_Var)
-				vtar = (Var*)tar->expr;
-			else if (tar->expr->type == T_RelabelType)
-				vtar = (Var*)((RelabelType*)tar->expr)->arg;
-			if (vtar == NULL)
-				continue;
-			RangeTblEntry* rte_1 = list_nth(global_rtable, vtar->varno - 1);
-			if (strcmp(rte->eref->aliasname, rte_1->eref->aliasname) == 0)
+			RangeTblEntry* rte_1 = list_nth(global_rtable, ((Var*)tar->expr)->varno - 1);
+			if (rte->relid == rte_1->relid)
 			{
+				Var* vtar = (Var*)tar->expr;
 				vtar->varno = transfer_array[vtar->varno - 1];
 				vtar->varnoold = vtar->varno;
 				reserved = true;
@@ -1320,13 +1221,13 @@ static List* settargetlist(const List* global_rtable, List* local_rtable, Comman
 				tar->resno = targetlist->length + 1;
 			else
 				tar->resno = 1;
-			//∏√±‰¡øÀ˘‘⁄µƒ±Ì÷±Ω”≤Œ”Î¥À¥Œjoin
+			//ËØ•ÂèòÈáèÊâÄÂú®ÁöÑË°®Áõ¥Êé•ÂèÇ‰∏éÊ≠§Ê¨°join
 			if (transfer_array[var->varno - 1] != 0)
 			{
 				var->varno = transfer_array[var->varno - 1];
 				var->varnoold = var->varno;
 			}
-			//∏√±‰¡øÀ˘‘⁄µƒ±Ìº‰Ω”≤Œ”Î¥À¥Œjoin
+			//ËØ•ÂèòÈáèÊâÄÂú®ÁöÑË°®Èó¥Êé•ÂèÇ‰∏éÊ≠§Ê¨°join
 			else
 			{
 				for (int i = 0; i < length; i++)
@@ -1455,20 +1356,14 @@ void dochange(RangeTblEntry* rte, char* relname, Relation relation, Oid relid)
 {
 	rte->relid = relid;
 	pfree(rte->eref->aliasname);
-	if (relname)
-	{
-		rte->eref->aliasname = relname;
-	}
+	rte->eref->aliasname = relname;
 	list_free(rte->eref->colnames);
 	rte->eref->colnames = NIL;
-	if (relation)
+	for (int i = 0; i < relation->rd_att->natts; i++)
 	{
-		for (int i = 0; i < relation->rd_att->natts; i++)
-		{
-			char* str = (char*)palloc((strlen(relation->rd_att->attrs[i].attname.data) + 1) * sizeof(char));
-			strcpy(str, relation->rd_att->attrs[i].attname.data);
-			rte->eref->colnames = lappend(rte->eref->colnames, makeString(str));
-		}
+		char* str = (char*)palloc((strlen(relation->rd_att->attrs[i].attname.data) + 1) * sizeof(char));
+		strcpy(str, relation->rd_att->attrs[i].attname.data);
+		rte->eref->colnames = lappend(rte->eref->colnames, makeString(str));
 	}
 	return;
 }
@@ -1529,7 +1424,7 @@ List* makeAggref(List* targetList)
 		aggref->aggvariadic = false;
 		aggref->args = lappend(NIL, old_tar);
 		aggref->location = -1;
-		tar->expr = (Expr*)aggref;
+		tar->expr = aggref;
 		resList = lappend(resList, tar);
 	}
 	return resList;
@@ -1545,11 +1440,6 @@ List* removeAggref(List* targetList)
 		if (old_tar->expr->type == T_Aggref)
 		{
 			TargetEntry* tar = lfirst(((Aggref*)old_tar->expr)->args->head);
-			if (tar->expr->type == T_RelabelType)
-			{
-				if (((RelabelType*)tar->expr)->relabelformat == COERCE_IMPLICIT_CAST)
-					tar->expr = ((RelabelType*)tar->expr)->arg;
-			}
 			tar->resname = old_tar->resname;
 			resList = lappend(resList, tar);
 		}
@@ -1663,14 +1553,14 @@ int tarfunc(Index* rels, PlannedStmt* new, PlannedStmt* old)
 	double fac_old, fac_new;
 	if (order_decision == hybrid_row)
 	{
-		if (new->planTree->plan_rows > 5)
+		if (new->planTree->plan_rows > 1)
 			fac_new = new->planTree->plan_rows;
 		else
-			fac_new = 5;
-		if (old->planTree->plan_rows > 5)
+			fac_new = 1;
+		if (old->planTree->plan_rows > 1)
 			fac_old = old->planTree->plan_rows;
 		else
-			fac_old = 5;
+			fac_old = 1;
 		if (fac_new / fac_old > old->planTree->total_cost / new->planTree->total_cost)
 		{
 			return OLDBETTER;
@@ -1683,14 +1573,14 @@ int tarfunc(Index* rels, PlannedStmt* new, PlannedStmt* old)
 	else if (order_decision == hybrid_sqrt)
 	{
 		double fac_old, fac_new;
-		if (new->planTree->plan_rows > 5)
+		if (new->planTree->plan_rows > 1)
 			fac_new = sqrt(new->planTree->plan_rows);
 		else
-			fac_new = sqrt(5.0);
-		if (old->planTree->plan_rows > 5)
+			fac_new = 1;
+		if (old->planTree->plan_rows > 1)
 			fac_old = sqrt(old->planTree->plan_rows);
 		else
-			fac_old = sqrt(5.0);
+			fac_old = 1;
 		if (fac_new / fac_old > old->planTree->total_cost / new->planTree->total_cost)
 		{
 			return OLDBETTER;
@@ -1702,14 +1592,14 @@ int tarfunc(Index* rels, PlannedStmt* new, PlannedStmt* old)
 	}
 	else if (order_decision == hybrid_log)
 	{
-		if (new->planTree->plan_rows > 5)
+		if (new->planTree->plan_rows > 1)
 			fac_new = log(new->planTree->plan_rows) / log(2);
 		else
-			fac_new = log(5) / log(2);
-		if (old->planTree->plan_rows > 5)
+			fac_new = 1;
+		if (old->planTree->plan_rows > 1)
 			fac_old = log(old->planTree->plan_rows) / log(2);
 		else
-			fac_old = log(5) / log(2);
+			fac_old = 1;
 		if (fac_new / fac_old > old->planTree->total_cost / new->planTree->total_cost)
 		{
 			return OLDBETTER;
@@ -1748,102 +1638,4 @@ int tarfunc(Index* rels, PlannedStmt* new, PlannedStmt* old)
 			return OLDBETTER;
 		return NEWBETTER;
 	}
-	return NEWBETTER;
-}
-
-static double getMatSize(Oid relid)
-{
-	int64 size = DatumGetInt64(DirectFunctionCall2Coll(pg_relation_size, 0, relid, (Datum)cstring_to_text("main")));
-	if (Abs(size) < 10 * 1024)
-		return (double)size / 1000000.0;
-	else
-	{
-		size >>= 9;
-		if (Abs(size) < 20 * 1024 - 1)
-			return (double)half_rounded(size) / 1000.0;
-		else
-		{
-			size >>= 10;
-			if (Abs(size) < 20 * 1024 - 1)
-				return (double)half_rounded(size);
-			else
-			{
-				size >>= 10;
-				if (Abs(size) < 20 * 1024 - 1)
-					return (double)half_rounded(size) * 1000.0;
-				else
-				{
-					size >>= 10;
-					return (double)half_rounded(size) * 1000000.0;
-				}
-			}
-		}
-	}
-}
-
-#ifdef artificial_error
-#define PI 3.141592654
-double Gaussian(double mu, double sigma)
-{
-	static double U, V;
-	static int phase = 0;
-	double z;
-	
-	if (phase == 0)
-	{
-		U = rand() / (RAND_MAX + 1.0);
-		V = rand() / (RAND_MAX + 1.0);
-		z = sqrt(-2.0 * log(U)) * sin(2.0 * PI * V);
-	}
-	else
-	{
-		z = sqrt(-2.0 * log(U)) * cos(2.0 * PI * V);
-	}
-	
-	phase = 1 - phase;
-
-	return z * sigma + mu;
-}
-#endif
-
-int writePlanNode(FILE* fp, PlanState* planstate)
-{
-	if (planstate->lefttree == NULL)
-		return 1;
-	if (planstate->type == T_BitmapHeapScanState)
-		return 1;
-	int left = 0;
-	int right = 0;
-	left = writePlanNode(fp, planstate->lefttree);
-	if (planstate->righttree != NULL)
-	{
-		right = writePlanNode(fp, planstate->righttree);
-		int64 input_size = 0;
-		if (planstate->righttree->instrument->ntuples == 0)
-		{
-			input_size += planstate->righttree->instrument->tuplecount;
-		}
-		else
-		{
-			input_size += planstate->righttree->instrument->ntuples;
-		}
-		if(planstate->lefttree->instrument->ntuples == 0)
-		{
-			input_size += planstate->lefttree->instrument->tuplecount;
-		}
-		else
-		{
-			input_size += planstate->lefttree->instrument->ntuples;
-		}
-		fprintf(fp, "(%d, %d, %d, %lld, %lld) ", left + right, 0, 0, (int64)planstate->instrument->tuplecount, planstate->instrument->counter.QuadPart);
-	}
-	return left + right;
-}
-
-void writeFile(char* file, QueryDesc* queryDesc)
-{
-	FILE* fp = fopen(file, "a+");
-	writePlanNode(fp, queryDesc->planstate);
-	fprintf(fp, "\n");
-	fclose(fp);
 }
